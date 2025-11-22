@@ -6,8 +6,8 @@
 #include "soc/rtc_cntl_reg.h"
 #include "NeuralNetwork.h"
 
-#define INPUT_W 160
-#define INPUT_H 160
+#define INPUT_W 90
+#define INPUT_H 90
 #define LED_BUILT_IN 21
 
 #define DEBUG_TFLITE 1
@@ -20,10 +20,13 @@
 #endif
 
 #if DEBUG_TFLITE==1
-#include "img.h"
+#include "test_images.h"
+
+const int NUM_TEST_IMAGES = 4;
+int current_test_image = 0;
 #endif
 
-const char* gesture_labels[] = {"Thumbs Down", "Fist", "Open Hand", "Thumbs Up"};
+const char* gesture_labels[] = {"Thumbs Down", "Fist", "Thumbs Up", "Palm"};
 const int NUM_GESTURES = 4;
 
 NeuralNetwork *g_nn;
@@ -173,12 +176,43 @@ void loop() {
     dur_prep = esp_timer_get_time() - start;
   }
 #else
-  float *input_data = g_nn->getInput()->data.f;
-  for (int i = 0; i < sizeof(img_data); i++) {
-    input_data[i] = (float)img_data[i];
+
+
+  TfLiteTensor* input_tensor = g_nn->getInput();
+  int8_t *input_data = input_tensor->data.int8;
+  float scale = input_tensor->params.scale;
+  int zero_point = input_tensor->params.zero_point;
+
+  Serial.printf("Input quantization: scale=%.6f, zero_point=%d\n", scale, zero_point);
+
+  int pixel_index = 0;
+  for (int y = 0; y < INPUT_H; y++) {
+    for (int x = 0; x < INPUT_W; x++) {
+      for (int c = 0; c < 3; c++) {
+        // Get pixel value from 4D array [0, 255]
+        int pixel_val = test_images[current_test_image][y][x][c];
+
+        int quantized_int = (int)(pixel_val / scale) + zero_point;
+
+        if (quantized_int > 127) quantized_int = 127;
+        if (quantized_int < -128) quantized_int = -128;
+
+        input_data[pixel_index++] = (int8_t)quantized_int;
+      }
+    }
   }
-  Serial.printf("Loaded test image. First 3 pixels: %.0f %.0f %.0f\n",
+
+
+  Serial.printf("First pixel (RGB): original=[%d,%d,%d], quantized=[%d,%d,%d]\n",
+    test_images[current_test_image][0][0][0],
+    test_images[current_test_image][0][0][1],
+    test_images[current_test_image][0][0][2],
     input_data[0], input_data[1], input_data[2]);
+
+  int first_r = test_images[current_test_image][0][0][0];
+  int quant_r = (int)(first_r / scale) + zero_point;
+  Serial.printf("First R channel: %d -> %d (scale=%.3f, zp=%d)\n",
+                first_r, quant_r, scale, zero_point);
 #endif
 
   start = esp_timer_get_time();
@@ -201,16 +235,45 @@ void loop() {
                 output_tensor->dims->size,
                 output_tensor->dims->data[0]);
 
-  float* output = output_tensor->data.f;
+  float output[NUM_GESTURES];
 
+  if (output_tensor->type == kTfLiteInt8) {
+    int8_t* output_int8 = output_tensor->data.int8;
+    float output_scale = output_tensor->params.scale;
+    int output_zero_point = output_tensor->params.zero_point;
 
-  Serial.print("Raw output values: [");
-  for (int i = 0; i < NUM_GESTURES; i++) {
-    Serial.printf("%.6f", output[i]);
-    if (i < NUM_GESTURES - 1) Serial.print(", ");
+    Serial.printf("Quantization params: scale=%.6f, zero_point=%d\n", output_scale, output_zero_point);
+
+    Serial.print("Raw output values (int8): [");
+    for (int i = 0; i < NUM_GESTURES; i++) {
+      Serial.printf("%d", output_int8[i]);
+      if (i < NUM_GESTURES - 1) Serial.print(", ");
+    }
+    Serial.println("]");
+
+    for (int i = 0; i < NUM_GESTURES; i++) {
+      output[i] = (output_int8[i] - output_zero_point) * output_scale;
+    }
+
+    Serial.print("Dequantized output values: [");
+    for (int i = 0; i < NUM_GESTURES; i++) {
+      Serial.printf("%.6f", output[i]);
+      if (i < NUM_GESTURES - 1) Serial.print(", ");
+    }
+    Serial.println("]");
+  } 
+  else if (output_tensor->type == kTfLiteFloat32) {
+    float* output_float = output_tensor->data.f;
+    Serial.print("Raw output values (float32): [");
+    for (int i = 0; i < NUM_GESTURES; i++) {
+      output[i] = output_float[i];
+      Serial.printf("%.6f", output[i]);
+      if (i < NUM_GESTURES - 1) Serial.print(", ");
+    }
+    Serial.println("]");
+  } else {
+    Serial.printf("ERROR: Unexpected output tensor type: %d\n", output_tensor->type);
   }
-  Serial.println("]");
-
 
   int max_idx = 0;
   float max_prob = output[0];
@@ -221,16 +284,13 @@ void loop() {
     }
   }
 
-
   Serial.print("Probabilities: ");
   for (int i = 0; i < NUM_GESTURES; i++) {
     Serial.printf("%s: %.3f  ", gesture_labels[i], output[i]);
   }
   Serial.println();
 
-
-  Serial.printf("Detected: %s (%.3f)\n", gesture_labels[max_idx], max_prob);
-
+  Serial.printf("Detected: %s (%.3f)\n\n\n", gesture_labels[max_idx], max_prob);
 
   if (max_prob > 0.6) {
     digitalWrite(LED_BUILT_IN, LOW);
@@ -242,6 +302,13 @@ void loop() {
   esp_camera_fb_return(fb);
   fb = NULL;
 #else
-  delay(3000);
+  current_test_image++;
+  if (current_test_image >= NUM_TEST_IMAGES) {
+    Serial.println("All tests completed! Restarting from first image...\n\n");
+    current_test_image = 0;
+    delay(5000);
+  } else {
+    delay(2000);
+  }
 #endif
 }

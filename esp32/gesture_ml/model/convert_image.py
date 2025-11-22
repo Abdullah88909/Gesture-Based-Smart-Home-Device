@@ -10,7 +10,7 @@ def convert_image_to_header(image_path, output_path='src/img.h'):
         img = Image.open(image_path).convert('RGB')
         print(f"Original size: {img.size}")
 
-        img = img.resize((160, 160))
+        img = img.resize((70, 70))
         print(f"Resized to: 160x160")
 
         img_array = np.array(img, dtype=np.uint8)

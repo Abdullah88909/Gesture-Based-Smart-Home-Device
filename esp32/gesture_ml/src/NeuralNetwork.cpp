@@ -1,5 +1,5 @@
 #include "NeuralNetwork.h"
-#include "model.cc"
+#include "model_data.h"
 
 #include <esp_attr.h>
 #include <Arduino.h>
