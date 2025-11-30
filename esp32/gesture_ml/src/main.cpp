@@ -5,33 +5,69 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "NeuralNetwork.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_timer.h"
+#include "esp_camera.h"
+#include <PubSubClient.h>
 
-#define INPUT_W 90
-#define INPUT_H 90
+#define CAMERA_W 96
+#define CAMERA_H 96
 #define LED_BUILT_IN 21
 
 #define DEBUG_TFLITE 1
-#define USE_CAMERA 0
+#define USE_CAMERA 1
+#define CAMERA_MODEL_XIAO_ESP32S3 1
 
-#if USE_CAMERA==1
+#define RESIZE_INPUT 1
+
+#if RESIZE_INPUT 
+  #define INPUT_W 48
+  #define INPUT_H 48
+#else
+  #define INPUT_W 96
+  #define INPUT_H 96
+#endif
+
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
+#include "camera_pins.h"
+
+const char* ssid = "";
+const char* password = "";
+
+#ifdef MQTT
+WebServer server(80);
+#endif
+const char* mqtt_topic = "esp32/state";
+
+const char* mqtt_server = "homeassistant.local";
+const int mqtt_port = 1883;
+const char* mqtt_user = "";
+const char* mqtt_password = "";
+
+#define FMODE
+
+#ifndef FMODE
+const char* gesture_labels[] = {"Thumbs Down", "Fist", "Thumbs Up", "None", "Palm"};
+const int NUM_GESTURES = 5;
 #endif
 
-#if DEBUG_TFLITE==1
-#include "test_images.h"
-
-const int NUM_TEST_IMAGES = 4;
-int current_test_image = 0;
-#endif
-
+#ifdef FMODE
 const char* gesture_labels[] = {"Thumbs Down", "Fist", "Thumbs Up", "Palm"};
 const int NUM_GESTURES = 4;
+#endif
 
 NeuralNetwork *g_nn;
+camera_fb_t *g_last_frame = NULL;
+WiFiClient streamClient;
+unsigned long fist_pause_until = 0;  
 
-#if USE_CAMERA==1
+#ifndef MQTT
+PubSubClient client(streamClient);
+#endif
+
 uint32_t rgb565torgb888(uint16_t color)
 {
   uint8_t hb, lb;
@@ -47,20 +83,58 @@ uint32_t rgb565torgb888(uint16_t color)
   return (r << 16) | (g << 8) | b;
 }
 
+
+#if RESIZE_INPUT
+// Resize image using nearest neighbor downsampling
 int GetImage(camera_fb_t * fb, TfLiteTensor* input)
 {
   assert(fb->format == PIXFORMAT_RGB565);
 
+  float *image_data = input->data.f;
+  int post = 0;
+
+  // Calculate scale factors
+  float scale_x = (float)CAMERA_W / INPUT_W;
+  float scale_y = (float)CAMERA_H / INPUT_H;
+
+  // Calculate starting position for center crop
+  int startx = (fb->width - CAMERA_W) / 2;
+  int starty = (fb->height - CAMERA_H);
+
+  for (int out_y = 0; out_y < INPUT_H; out_y++) {
+    for (int out_x = 0; out_x < INPUT_W; out_x++) {
+      // Nearest neighbor sampling
+      int src_x = (int)(out_x * scale_x);
+      int src_y = (int)(out_y * scale_y);
+
+      int getPos = (starty + src_y) * fb->width + startx + src_x;
+      uint16_t color = ((uint16_t *)fb->buf)[getPos];
+      uint32_t rgb = rgb565torgb888(color);
+
+      image_data[post * 3 + 0] = ((rgb >> 16) & 0xFF);
+      image_data[post * 3 + 1] = ((rgb >> 8) & 0xFF);
+      image_data[post * 3 + 2] = (rgb & 0xFF);
+      post++;
+    }
+  }
+  return 0;
+}
+#else
+// No resize - direct crop from center
+int GetImage(camera_fb_t * fb, TfLiteTensor* input)
+{
+  assert(fb->format == PIXFORMAT_RGB565);
+
+  float *image_data = input->data.f;
   int post = 0;
   int startx = (fb->width - INPUT_W) / 2;
   int starty = (fb->height - INPUT_H);
+
   for (int y = 0; y < INPUT_H; y++) {
     for (int x = 0; x < INPUT_W; x++) {
       int getPos = (starty + y) * fb->width + startx + x;
       uint16_t color = ((uint16_t *)fb->buf)[getPos];
       uint32_t rgb = rgb565torgb888(color);
-
-      float *image_data = input->data.f;
 
       image_data[post * 3 + 0] = ((rgb >> 16) & 0xFF);
       image_data[post * 3 + 1] = ((rgb >> 8) & 0xFF);
@@ -72,6 +146,160 @@ int GetImage(camera_fb_t * fb, TfLiteTensor* input)
 }
 #endif
 
+#ifdef MQTT
+void handle_snapshot() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+
+  uint8_t * jpg_buf = NULL;
+  size_t jpg_len = 0;
+  bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+
+  if (!converted) {
+    esp_camera_fb_return(fb);
+    server.send(500, "text/plain", "JPEG conversion failed");
+    return;
+  }
+
+  WiFiClient client = server.client();
+
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: image/jpeg");
+  client.print("Content-Length: ");
+  client.println(jpg_len);
+  client.println("Connection: close");
+  client.println();
+
+
+  client.write(jpg_buf, jpg_len);
+
+
+  free(jpg_buf);
+  esp_camera_fb_return(fb);
+}
+
+
+void handle_stream() {
+
+  streamClient = server.client();
+
+  streamClient.println("HTTP/1.1 200 OK");
+  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+  streamClient.println();
+
+  Serial.println("Stream client connected");
+}
+
+void sendStreamFrame() {
+
+  if (!streamClient || !streamClient.connected()) {
+    if (streamClient) {
+      streamClient.stop();
+    }
+    return;
+  }
+
+  if (g_last_frame == NULL) {
+    return;
+  }
+
+  uint8_t * jpg_buf = NULL;
+  size_t jpg_len = 0;
+  bool converted = frame2jpg(g_last_frame, 80, &jpg_buf, &jpg_len);
+
+  if (!converted) {
+    return;
+  }
+
+  streamClient.println("--frame");
+  streamClient.println("Content-Type: image/jpeg");
+  streamClient.print("Content-Length: ");
+  streamClient.println(jpg_len);
+  streamClient.println();
+  streamClient.write(jpg_buf, jpg_len);
+  streamClient.println();
+
+
+  free(jpg_buf);
+}
+
+#endif
+
+#ifndef MQTT
+void reconnectMQTT() {
+  int mqttAttempts = 0;
+  while (!client.connected()) {
+    Serial.println();
+    Serial.println("========================================");
+    Serial.print("Attempting MQTT connection to: ");
+    Serial.print(mqtt_server);
+    Serial.print(":");
+    Serial.println(mqtt_port);
+
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    Serial.print("Client ID: ");
+    Serial.println(clientId);
+
+    bool connected;
+    if (strlen(mqtt_user) > 0) {
+      Serial.print("Using authentication - Username: ");
+      Serial.println(mqtt_user);
+      connected = client.connect(clientId.c_str(), mqtt_user, mqtt_password);
+    } else {
+      Serial.println("No authentication");
+      connected = client.connect(clientId.c_str());
+    }
+
+    if (connected) {
+      Serial.println("MQTT CONNECTED!");
+      Serial.println("========================================");
+      Serial.println("Ready to publish messages.");
+      Serial.print("Publish topic: ");
+      Serial.println(mqtt_topic);
+      Serial.println("Type a message and press Enter to publish");
+      Serial.println("========================================");
+    } else {
+      Serial.print("MQTT Connection FAILED! Error code: ");
+      Serial.println(client.state());
+      Serial.println("Error meanings:");
+      Serial.println("  -4: Connection timeout");
+      Serial.println("  -3: Connection lost");
+      Serial.println("  -2: Connection failed");
+      Serial.println("  -1: Disconnected");
+      Serial.println("   1: Bad protocol");
+      Serial.println("   2: Bad client ID");
+      Serial.println("   3: Server unavailable");
+      Serial.println("   4: Bad credentials");
+      Serial.println("   5: Unauthorized");
+
+      mqttAttempts++;
+      if (mqttAttempts > 10) {
+        Serial.println("========================================");
+        Serial.println("MQTT connection failed after 10 attempts!");
+        Serial.println("Possible issues:");
+        Serial.println("  - MQTT broker hostname/IP incorrect");
+        Serial.println("  - MQTT broker not running");
+        Serial.println("  - Wrong port number");
+        Serial.println("  - Invalid credentials");
+        Serial.println("  - Firewall blocking connection");
+        Serial.println("Restarting in 10 seconds...");
+        Serial.println("========================================");
+        delay(10000);
+        ESP.restart();
+      }
+
+      Serial.println("Retrying in 5 seconds...");
+      Serial.println("========================================");
+      delay(5000);
+    }
+  }
+}
+#endif
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
@@ -87,7 +315,12 @@ void setup() {
   delay(5000);
   Serial.setDebugOutput(false);
 
-#if USE_CAMERA==1
+  // Initialize neural network BEFORE camera to ensure clean memory allocation
+  Serial.println("Initializing neural network...");
+  Serial.println("About to call NeuralNetwork constructor...");
+  g_nn = new NeuralNetwork();
+  Serial.println("NeuralNetwork constructor returned");
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -108,7 +341,7 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;
+  config.frame_size = FRAMESIZE_XGA;  
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -126,15 +359,6 @@ void setup() {
   Serial.printf("Camera init success!\n");
   Serial.printf("frame_size=%d\n", config.frame_size);
   Serial.printf("pixel_format=%d\n", config.pixel_format);
-#else
-  pinMode(LED_BUILT_IN, OUTPUT);
-  Serial.println("Running in DEBUG mode - Camera disabled");
-#endif
-
-  Serial.println("Initializing neural network...");
-  Serial.println("About to call NeuralNetwork constructor...");
-  g_nn = new NeuralNetwork();
-  Serial.println("NeuralNetwork constructor returned");
 
   if (g_nn == nullptr) {
     Serial.println("ERROR: Failed to create NeuralNetwork!");
@@ -153,15 +377,101 @@ void setup() {
 
   Serial.println("Neural network initialized successfully!");
 
+  // Initialize WiFi after NN to ensure NN gets clean memory allocation
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int wifi_retries = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_retries < 20) {
+    delay(500);
+    Serial.print(".");
+    wifi_retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWi-Fi connection failed, continuing without WiFi");
+  }
+
+  #ifdef MQTT
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html",
+      "<!DOCTYPE html>"
+      "<html><head>"
+      "<title>ESP32 Gesture Recognition</title>"
+      "<style>"
+      "body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }"
+      "img { max-width: 800px; border: 2px solid #333; }"
+      "h1 { color: #333; }"
+      "</style>"
+      "</head><body>"
+      "<h1>ESP32 Camera Stream</h1>"
+      "<img src=\"/stream\" />"
+      "<p>Live video stream from ESP32 camera</p>"
+      "<p><a href=\"/snapshot\">Click for single snapshot</a></p>"
+      "</body></html>");
+  });
+
+  server.on("/snapshot", HTTP_GET, handle_snapshot);
+  server.on("/stream", HTTP_GET, handle_stream);
+
+   server.begin();
+  Serial.println("HTTP server started");
+  #endif
+
+  #ifndef MQTT
+  client.setServer(mqtt_server, mqtt_port);
+
+  reconnectMQTT();
+  #endif
+ 
 }
 
 
 void loop() {
+  #ifndef MQTT
+  if (!client.connected()) {
+    Serial.println("\n[WARNING] MQTT disconnected! Reconnecting...");
+    reconnectMQTT();
+  }
+  client.loop();
+  #endif
+
+
+  unsigned long current_time = millis();
+  if (fist_pause_until > 0 && current_time < fist_pause_until) {
+
+    #ifndef MQTT
+    Serial.println("Fist pause active - sending OFF");
+    client.publish(mqtt_topic, "OFF");
+    #endif
+
+    #ifdef MQTT
+    server.handleClient();
+    sendStreamFrame();
+    #endif
+
+    delay(100); 
+    return;
+  } else if (fist_pause_until > 0 && current_time >= fist_pause_until) {
+
+    Serial.println("Fist pause ended - resuming normal operation");
+    fist_pause_until = 0;
+  }
+
   uint64_t start, dur_prep = 0, dur_infer;
 
-#if USE_CAMERA==1
   camera_fb_t * fb = NULL;
   esp_err_t res = ESP_OK;
+
+  if (g_last_frame != NULL) {
+    esp_camera_fb_return(g_last_frame);
+    g_last_frame = NULL;
+  }
 
   fb = esp_camera_fb_get();
   if (!fb) {
@@ -170,145 +480,63 @@ void loop() {
     return;
   }
 
+  g_last_frame = fb;
+
   if(fb->format != PIXFORMAT_JPEG){
     start = esp_timer_get_time();
     GetImage(fb, g_nn->getInput());
     dur_prep = esp_timer_get_time() - start;
   }
-#else
 
+  #ifdef MQTT
+  server.handleClient();
 
-  TfLiteTensor* input_tensor = g_nn->getInput();
-  int8_t *input_data = input_tensor->data.int8;
-  float scale = input_tensor->params.scale;
-  int zero_point = input_tensor->params.zero_point;
-
-  Serial.printf("Input quantization: scale=%.6f, zero_point=%d\n", scale, zero_point);
-
-  int pixel_index = 0;
-  for (int y = 0; y < INPUT_H; y++) {
-    for (int x = 0; x < INPUT_W; x++) {
-      for (int c = 0; c < 3; c++) {
-        // Get pixel value from 4D array [0, 255]
-        int pixel_val = test_images[current_test_image][y][x][c];
-
-        int quantized_int = (int)(pixel_val / scale) + zero_point;
-
-        if (quantized_int > 127) quantized_int = 127;
-        if (quantized_int < -128) quantized_int = -128;
-
-        input_data[pixel_index++] = (int8_t)quantized_int;
-      }
-    }
-  }
-
-
-  Serial.printf("First pixel (RGB): original=[%d,%d,%d], quantized=[%d,%d,%d]\n",
-    test_images[current_test_image][0][0][0],
-    test_images[current_test_image][0][0][1],
-    test_images[current_test_image][0][0][2],
-    input_data[0], input_data[1], input_data[2]);
-
-  int first_r = test_images[current_test_image][0][0][0];
-  int quant_r = (int)(first_r / scale) + zero_point;
-  Serial.printf("First R channel: %d -> %d (scale=%.3f, zp=%d)\n",
-                first_r, quant_r, scale, zero_point);
-#endif
-
+  #endif
   start = esp_timer_get_time();
-  g_nn->predict();
+  TfLiteStatus invoke_status = g_nn->predict();
   dur_infer = esp_timer_get_time() - start;
 
-#if USE_CAMERA==1
   Serial.printf("Preprocessing: %llu ms, Inference: %llu ms\n", dur_prep/1000, dur_infer/1000);
-#else
-  Serial.printf("Inference: %llu ms\n", dur_infer/1000);
-  float fps_estimate = (dur_infer > 0) ? (1000000.0 / dur_infer) : 0.0;
-  Serial.printf("Estimated max FPS: %.2f\n", fps_estimate);
-#endif
-
 
   TfLiteTensor* output_tensor = g_nn->getOutput();
-
-  Serial.printf("Output tensor type: %d, dims: %d, elements: %d\n",
-                output_tensor->type,
-                output_tensor->dims->size,
-                output_tensor->dims->data[0]);
-
-  float output[NUM_GESTURES];
-
-  if (output_tensor->type == kTfLiteInt8) {
-    int8_t* output_int8 = output_tensor->data.int8;
-    float output_scale = output_tensor->params.scale;
-    int output_zero_point = output_tensor->params.zero_point;
-
-    Serial.printf("Quantization params: scale=%.6f, zero_point=%d\n", output_scale, output_zero_point);
-
-    Serial.print("Raw output values (int8): [");
-    for (int i = 0; i < NUM_GESTURES; i++) {
-      Serial.printf("%d", output_int8[i]);
-      if (i < NUM_GESTURES - 1) Serial.print(", ");
-    }
-    Serial.println("]");
-
-    for (int i = 0; i < NUM_GESTURES; i++) {
-      output[i] = (output_int8[i] - output_zero_point) * output_scale;
-    }
-
-    Serial.print("Dequantized output values: [");
-    for (int i = 0; i < NUM_GESTURES; i++) {
-      Serial.printf("%.6f", output[i]);
-      if (i < NUM_GESTURES - 1) Serial.print(", ");
-    }
-    Serial.println("]");
-  } 
-  else if (output_tensor->type == kTfLiteFloat32) {
-    float* output_float = output_tensor->data.f;
-    Serial.print("Raw output values (float32): [");
-    for (int i = 0; i < NUM_GESTURES; i++) {
-      output[i] = output_float[i];
-      Serial.printf("%.6f", output[i]);
-      if (i < NUM_GESTURES - 1) Serial.print(", ");
-    }
-    Serial.println("]");
-  } else {
-    Serial.printf("ERROR: Unexpected output tensor type: %d\n", output_tensor->type);
-  }
-
-  int max_idx = 0;
-  float max_prob = output[0];
-  for (int i = 1; i < NUM_GESTURES; i++) {
-    if (output[i] > max_prob) {
-      max_prob = output[i];
-      max_idx = i;
-    }
-  }
-
-  Serial.print("Probabilities: ");
+  Serial.println("Raw output scores:");
   for (int i = 0; i < NUM_GESTURES; i++) {
-    Serial.printf("%s: %.3f  ", gesture_labels[i], output[i]);
+    Serial.printf("  %s: %.3f\n", gesture_labels[i], output_tensor->data.f[i]);
   }
-  Serial.println();
 
-  Serial.printf("Detected: %s (%.3f)\n\n\n", gesture_labels[max_idx], max_prob);
+  #ifndef MQTT
+  if (output_tensor->data.f[0] > 0.65) {
+    Serial.println("Gesture Detected: Thumbs Down");
+    client.publish(mqtt_topic, "DIM");
+  } else if (output_tensor->data.f[1] > 0.65) {
+    Serial.println("Gesture Detected: Fist");
+    client.publish(mqtt_topic, "OFF");
+    fist_pause_until = millis() + 20000;
+    Serial.println("Starting 2 second fist pause");
+  } else if (output_tensor->data.f[2] >0.65) {
+    Serial.println("Gesture Detected: Thumbs Up");
+    client.publish(mqtt_topic, "BRIGHTEN");
 
-  if (max_prob > 0.6) {
-    digitalWrite(LED_BUILT_IN, LOW);
+  }
+  #ifdef FMODE
+  else if (output_tensor->data.f[3] > 0.65) {
+    Serial.println("Gesture Detected: Palm");
+    client.publish(mqtt_topic, "ON");
   } else {
-    digitalWrite(LED_BUILT_IN, HIGH);
+    Serial.println("No significant gesture detected.");
   }
-
-#if USE_CAMERA==1
-  esp_camera_fb_return(fb);
-  fb = NULL;
-#else
-  current_test_image++;
-  if (current_test_image >= NUM_TEST_IMAGES) {
-    Serial.println("All tests completed! Restarting from first image...\n\n");
-    current_test_image = 0;
-    delay(5000);
+  #else
+  else if (output_tensor->data.f[4] > 0.7) {
+    Serial.println("Gesture Detected: Palm");
+    client.publish(mqtt_topic, "ON");
   } else {
-    delay(2000);
+    Serial.println("No significant gesture detected.");
   }
-#endif
+  #endif
+  #endif
+
+  #ifdef MQTT
+  sendStreamFrame();
+
+  #endif
 }

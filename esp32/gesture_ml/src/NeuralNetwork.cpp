@@ -4,8 +4,9 @@
 #include <esp_attr.h>
 #include <Arduino.h>
 
-int kTensorArenaSize = 3 * 1024 * 1024;
 
+int kTensorArenaSize = 2 * 1024 * 1024;
+#define USE_ALLOPS 1
 NeuralNetwork::NeuralNetwork()
 {
     printf("\n=== NeuralNetwork Constructor Started ===\n");
@@ -115,7 +116,11 @@ TfLiteTensor* NeuralNetwork::getInput()
 
 TfLiteStatus NeuralNetwork::predict()
 {
-    return interpreter->Invoke();
+    TfLiteStatus status = interpreter->Invoke();
+    if (status != kTfLiteOk) {
+        printf("ERROR: Invoke() failed with status %d\n", status);
+    }
+    return status;
 }
 
 TfLiteTensor* NeuralNetwork::getOutput()

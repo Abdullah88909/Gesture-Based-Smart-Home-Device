@@ -18,7 +18,6 @@ namespace tflite
     class MicroInterpreter;
 }
 
-#define USE_ALLOPS 0
 
 class NeuralNetwork
 {
